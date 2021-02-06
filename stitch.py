@@ -76,10 +76,9 @@ def allBlack(im):
     data = np.asarray(im.convert('RGBA'))
     return np.count_nonzero(data[:,:,:3]) == 0
 
-def buildImage(defn, icons, version, plane, overallWidth, overallHeight):
+def buildImage(im, defn, icons, version, plane, overallWidth, overallHeight):
     lowX, highX, lowY, highY, planes = getBounds(defn['regionList'])
     validIcons = []
-    im = Image.new("RGB", (overallWidth + 512, overallHeight + 512))
     for region in defn['regionList']:
         if 'xLowerLeft' in region:
             oldLowX = region['xLowerLeft']
@@ -139,13 +138,13 @@ def buildImage(defn, icons, version, plane, overallWidth, overallHeight):
                         im.paste(square, box=(imX+256, imY+256))
         else:
             raise ValueError(region)
-        return im, validIcons
+    return validIcons
 
 def layerBelow(im):
     im = ImageEnhance.Color(im).enhance(0.5) # 50% grayscale
     im = ImageEnhance.Brightness(im).enhance(0.7) # 30% darkness
     # im = ImageEnhance.Contrast(im).enhance(0.8) # 80% contrast
-    im = im.filter(ImageFilter.GaussianBlur(radius=1))
+    # Do not perform blur here, because blurring with alpha channels is messy.
     return im
 
 def buildMapID(defn, version, icons, iconSprites, baseMaps):
@@ -165,11 +164,11 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
     baseMaps.append({'mapId': mapId, 'name': defn['name'], 'bounds': bounds, 'center': center})
     overallHeight = (highY - lowY + 1) * px_per_square * 64
     overallWidth = (highX - lowX + 1) * px_per_square * 64
-
     layersBelow = None
     for plane in range(planes):
         print(mapId, plane)
-        im, validIcons = buildImage(defn, icons, version, plane, overallWidth, overallHeight)
+        im = Image.new("RGB", (overallWidth + 512, overallHeight + 512))
+        validIcons = buildImage(im, defn, icons, version, plane, overallWidth, overallHeight)
         if plane == 0:
             data = np.asarray(im.convert('RGB')).copy()
             data[(data == (255, 0, 255)).all(axis = -1)] = (0, 0, 0)
@@ -181,9 +180,13 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
             data[:,:,3] = 255*(data[:,:,:3] != (255, 0, 255)).all(axis = -1)
             mask = Image.fromarray(data, mode='RGBA')
             im = layersBelow.convert("RGBA")
+            # All filters except for blur are applied in layerBelow();
+            # Apply blur just before pasting the current layer on top.
+            im = im.filter(ImageFilter.GaussianBlur(radius=1))
             im.paste(mask, (0, 0), mask)
             if planes > plane and INTERMEDIATE:
-                layersBelow.paste(layerBelow(mask))
+                below = layerBelow(mask)
+                layersBelow.paste(below, (0, 0), below)
         mem()
 
         for zoom in range(-3, 4):
