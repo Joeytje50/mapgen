@@ -8,6 +8,7 @@ import glob
 import numpy as np
 from collections import defaultdict
 import resource
+import multiprocessing as mp
 
 #Constants
 PADDING = 64
@@ -76,7 +77,7 @@ def allBlack(im):
     data = np.asarray(im.convert('RGBA'))
     return np.count_nonzero(data[:,:,:3]) == 0
 
-def buildImage(im, defn, icons, version, plane, overallWidth, overallHeight):
+def buildImage(queue, im, defn, icons, version, plane, overallWidth, overallHeight):
     lowX, highX, lowY, highY, planes = getBounds(defn['regionList'])
     validIcons = []
     for region in defn['regionList']:
@@ -138,7 +139,11 @@ def buildImage(im, defn, icons, version, plane, overallWidth, overallHeight):
                         im.paste(square, box=(imX+256, imY+256))
         else:
             raise ValueError(region)
-    return validIcons
+    if queue:
+        # return values in queue
+        queue.put(im)
+        queue.put(validIcons)
+    #return validIcons
 
 def layerBelow(im):
     im = ImageEnhance.Color(im).enhance(0.5) # 50% grayscale
@@ -161,14 +166,26 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
     else:
         print('cent')
         center = [(lowX + highX + 1) * 32, (lowY + highY + 1) * 32]
-    baseMaps.append({'mapId': mapId, 'name': defn['name'], 'bounds': bounds, 'center': center})
+    baseMaps.put({'mapId': mapId, 'name': defn['name'], 'bounds': bounds, 'center': center})
     overallHeight = (highY - lowY + 1) * px_per_square * 64
     overallWidth = (highX - lowX + 1) * px_per_square * 64
     layersBelow = None
     for plane in range(planes):
         print(mapId, plane)
         im = Image.new("RGB", (overallWidth + 512, overallHeight + 512))
-        validIcons = buildImage(im, defn, icons, version, plane, overallWidth, overallHeight)
+
+        # run this in a separate process to allow better cleaning up after running this function.
+        ctx = mp.get_context('spawn')
+        q = ctx.Queue()
+        p = ctx.Process(
+            target=buildImage,
+            args=(q, im, defn, icons, version, plane, overallWidth, overallHeight)
+        )
+        p.start()
+        im = q.get()
+        validIcons = q.get()
+        p.join()
+
         if plane == 0:
             data = np.asarray(im.convert('RGB')).copy()
             data[(data == (255, 0, 255)).all(axis = -1)] = (0, 0, 0)
@@ -258,10 +275,19 @@ def main():
         iconSprites[spriteId] = Image.open(file)
 
     baseMaps = []
+    ctx = mp.get_context('spawn')
+    q = ctx.Queue()
     for defn in defs:
-        buildMapID(defn, version, icons, iconSprites, baseMaps)
+        p = ctx.Process(
+            target=buildMapID,
+            args=(defn, version, icons, iconSprites, q)
+        )
+        p.start()
+        baseMaps.append(q.get())
+        p.join()
 
     with open("versions/{}/basemaps.json".format(version, 'w')) as f:
         json.dump(baseMaps, f)
 
-main()
+if __name__ == "__main__":
+    main()
