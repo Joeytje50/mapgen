@@ -7,10 +7,18 @@ import errno
 import glob
 import numpy as np
 from collections import defaultdict
+import resource
 
 #Constants
 PADDING = 64
+FULLMAP = False
+INTERMEDIATE = True
 px_per_square = 4
+
+def mem():
+    print('Memory usage         : % 2.2f MB' % round(
+        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024.0,1)
+    )
 
 def mkdir_p(path):
     try:
@@ -132,6 +140,13 @@ def buildImage(defn, icons, version, plane, overallWidth, overallHeight):
             raise ValueError(region)
         return im, validIcons
 
+def layerBelow(im):
+    im = ImageEnhance.Color(im).enhance(0.5) # 50% grayscale
+    im = ImageEnhance.Brightness(im).enhance(0.7) # 30% darkness
+    # im = ImageEnhance.Contrast(im).enhance(0.8) # 80% contrast
+    im = im.filter(ImageFilter.GaussianBlur(radius=1))
+    return im
+
 #### MAIN ####
 
 def main():
@@ -147,6 +162,23 @@ def main():
 
     with open("versions/{}/minimapIcons.json".format(version)) as f:
         icons = json.load(f)
+
+    if FULLMAP:
+        overallXLow = 999
+        overallXHigh = 0
+        overallYLow = 999
+        overallYHigh = 0
+        for file in glob.glob("versions/{}/tiles/base/*.png".format(version)):
+            filename = file.split("/")[-1]
+            filename = filename.replace(".png", "")
+            plane, x, y = map(int, filename.split("_"))
+            overallYHigh = max(y, overallYHigh)
+            overallYLow = min(y, overallYLow)
+            overallXHigh = max(x, overallXHigh)
+            overallXLow = min(x, overallXLow)
+
+        defs.append({"name": "debug", "mapId": -1, "regionList": [{"xLowerLeft": overallXLow, "yUpperRight": overallYHigh, "yLowerRight": overallYLow, "yLowerLeft": overallYLow, "numberOfPlanes": 4, "xUpperLeft": overallXLow, "xUpperRight": overallXHigh, "yUpperLeft": overallYHigh, "plane": 0, "xLowerRight": overallXHigh}]})
+
 
     iconSprites = {}
     for file in glob.glob("versions/{}/icons/*.png".format(version)):
@@ -172,7 +204,7 @@ def main():
         overallHeight = (highY - lowY + 1) * px_per_square * 64
         overallWidth = (highX - lowX + 1) * px_per_square * 64
 
-        plane0Map = None
+        layersBelow = None
         for plane in range(planes):
             print(mapId, plane)
             im, validIcons = buildImage(defn, icons, version, plane, overallWidth, overallHeight)
@@ -181,16 +213,16 @@ def main():
                 data[(data == (255, 0, 255)).all(axis = -1)] = (0, 0, 0)
                 im = Image.fromarray(data, mode='RGB')
                 if planes > 1:
-                    plane0Map = ImageEnhance.Color(im).enhance(0.5) # 50% grayscale
-                    plane0Map = ImageEnhance.Brightness(plane0Map).enhance(0.7) # 30% darkness
-                    # plane0Map = ImageEnhance.Contrast(plane0Map).enhance(0.8) # 80% contrast
-                    plane0Map = im.filter(ImageFilter.GaussianBlur(radius=1))
+                    layersBelow = layerBelow(im)
             elif plane > 0:
                 data = np.asarray(im.convert('RGBA')).copy()
                 data[:,:,3] = 255*(data[:,:,:3] != (255, 0, 255)).all(axis = -1)
                 mask = Image.fromarray(data, mode='RGBA')
-                im = plane0Map.convert("RGBA")
+                im = layersBelow.convert("RGBA")
                 im.paste(mask, (0, 0), mask)
+                if planes > plane and INTERMEDIATE:
+                    layersBelow.paste(layerBelow(mask))
+            mem()
 
             for zoom in range(-3, 4):
                 scalingFactor = 2.0**zoom/2.0**2
