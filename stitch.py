@@ -7,7 +7,6 @@ import errno
 import glob
 import numpy as np
 from collections import defaultdict
-import resource
 import multiprocessing as mp
 
 #Constants
@@ -16,10 +15,11 @@ FULLMAP = False
 INTERMEDIATE = True
 px_per_square = 4
 
-def mem():
-    print('Memory usage         : % 2.2f MB' % round(
-        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024.0,1)
-    )
+#Filters
+ENHANCE = 0.5 # grayscale: in range 0 (100% grayscale) to 1 (original)
+BRIGHT = 0.7 # brightness: in range 0 (100% black) to 1 (original)
+CONTRAST = 1.0 # contrast: in range 0 (100% grey) to 1 (original)
+BLUR = 1 # Gaussian blur radius in px: 0 (original) or higher for more blur.
 
 def mkdir_p(path):
     try:
@@ -77,6 +77,7 @@ def allBlack(im):
     data = np.asarray(im.convert('RGBA'))
     return np.count_nonzero(data[:,:,:3]) == 0
 
+# Build individual images for a given plane
 def buildImage(queue, im, defn, icons, version, plane, overallWidth, overallHeight):
     lowX, highX, lowY, highY, planes = getBounds(defn['regionList'])
     validIcons = []
@@ -139,19 +140,22 @@ def buildImage(queue, im, defn, icons, version, plane, overallWidth, overallHeig
                         im.paste(square, box=(imX+256, imY+256))
         else:
             raise ValueError(region)
-    if queue:
-        # return values in queue
-        queue.put(im)
-        queue.put(validIcons)
-    #return validIcons
+    # return values in queue
+    queue.put(im)
+    queue.put(validIcons)
 
+# render the layer below with the colour-related filters.
 def layerBelow(im):
-    im = ImageEnhance.Color(im).enhance(0.5) # 50% grayscale
-    im = ImageEnhance.Brightness(im).enhance(0.7) # 30% darkness
-    # im = ImageEnhance.Contrast(im).enhance(0.8) # 80% contrast
+    if ENHANCE != 1:
+        im = ImageEnhance.Color(im).enhance(ENHANCE)
+    if BRIGHT != 1:
+        im = ImageEnhance.Brightness(im).enhance(BRIGHT)
+    if CONTRAST != 1:
+        im = ImageEnhance.Contrast(im).enhance(CONTRAST)
     # Do not perform blur here, because blurring with alpha channels is messy.
     return im
 
+# Build map for a given mapID (stored in defn)
 def buildMapID(defn, version, icons, iconSprites, baseMaps):
     mapId = -1
     if 'mapId' in defn:
@@ -199,42 +203,52 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
             im = layersBelow.convert("RGBA")
             # All filters except for blur are applied in layerBelow();
             # Apply blur just before pasting the current layer on top.
-            im = im.filter(ImageFilter.GaussianBlur(radius=1))
+            if BLUR != 0:
+                im = im.filter(ImageFilter.GaussianBlur(radius=BLUR))
             im.paste(mask, (0, 0), mask)
             if planes > plane and INTERMEDIATE:
                 below = layerBelow(mask)
                 layersBelow.paste(below, (0, 0), below)
-        mem()
 
+        ctx = mp.get_context('spawn')
         for zoom in range(-3, 4):
-            scalingFactor = 2.0**zoom/2.0**2
-            zoomedWidth = int(round(scalingFactor * im.width))
-            zoomedHeight = int(round(scalingFactor * im.height))
-            zoomed = im.resize((zoomedWidth, zoomedHeight), resample=Image.BILINEAR)
-            if zoom >= 0:
-                for x, y, spriteId in validIcons:
-                    sprite = iconSprites[spriteId]
-                    width, height = sprite.size
-                    imX = int(round((x - lowX * 64) * px_per_square * scalingFactor)) - width // 2 - 2
-                    imY = int(round(((highY + 1) * 64 - y) * px_per_square * scalingFactor)) - height // 2 - 2
-                    zoomed.paste(sprite, (imX+int(round(256*scalingFactor)), int(round(imY+256 * scalingFactor))), sprite)
+            p = ctx.Process(
+                target=zoomLevels,
+                args=(im, validIcons, zoom, version, mapId, plane, iconSprites, defn['regionList'])
+            )
+            p.start()
+            p.join() # May be possible to paralellize this
 
-            lowZoomedX = int((lowX - 1) * scalingFactor + 0.01)
-            highZoomedX = int((highX + 0.9 + 1) * scalingFactor + 0.01)
-            lowZoomedY = int((lowY - 1) * scalingFactor + 0.01)
-            highZoomedY = int((highY + 0.9 + 1) * scalingFactor + 0.01)
-            for x in range(lowZoomedX, highZoomedX + 1):
-                for y in range(lowZoomedY, highZoomedY + 1):
-                    coordX = int((x - (lowX - 1) * scalingFactor) * 256)
-                    coordY = int((y - (lowY - 1) * scalingFactor) * 256)
-                    cropped = zoomed.crop((coordX, zoomed.size[1] - coordY - 256, coordX + 256, zoomed.size[1] - coordY))
-                    if not allBlack(cropped):
-                        outfilename = "versions/{}/tiles/rendered/{}/{}/{}_{}_{}.png".format(version, mapId, zoom, plane, x, y)
-                        mkdir_p(outfilename)
-                        cropped.save(outfilename)
-            # outfilename = "versions/{}/tiles/rendered/{}/{}_{}_full.png".format(version, mapId, plane, zoom)
-            # mkdir_p(outfilename)
-            # zoomed.save(outfilename)
+def zoomLevels(im, validIcons, zoom, version, mapId, plane, iconSprites, regionList):
+    lowX, highX, lowY, highY, planes = getBounds(regionList)
+    scalingFactor = 2.0**zoom/2.0**2
+    zoomedWidth = int(round(scalingFactor * im.width))
+    zoomedHeight = int(round(scalingFactor * im.height))
+    zoomed = im.resize((zoomedWidth, zoomedHeight), resample=Image.BILINEAR)
+    if zoom >= 0:
+        for x, y, spriteId in validIcons:
+            sprite = iconSprites[spriteId]
+            width, height = sprite.size
+            imX = int(round((x - lowX * 64) * px_per_square * scalingFactor)) - width // 2 - 2
+            imY = int(round(((highY + 1) * 64 - y) * px_per_square * scalingFactor)) - height // 2 - 2
+            zoomed.paste(sprite, (imX+int(round(256*scalingFactor)), int(round(imY+256 * scalingFactor))), sprite)
+
+    lowZoomedX = int((lowX - 1) * scalingFactor + 0.01)
+    highZoomedX = int((highX + 0.9 + 1) * scalingFactor + 0.01)
+    lowZoomedY = int((lowY - 1) * scalingFactor + 0.01)
+    highZoomedY = int((highY + 0.9 + 1) * scalingFactor + 0.01)
+    for x in range(lowZoomedX, highZoomedX + 1):
+        for y in range(lowZoomedY, highZoomedY + 1):
+            coordX = int((x - (lowX - 1) * scalingFactor) * 256)
+            coordY = int((y - (lowY - 1) * scalingFactor) * 256)
+            cropped = zoomed.crop((coordX, zoomed.size[1] - coordY - 256, coordX + 256, zoomed.size[1] - coordY))
+            if not allBlack(cropped):
+                outfilename = "versions/{}/tiles/rendered/{}/{}/{}_{}_{}.png".format(version, mapId, zoom, plane, x, y)
+                mkdir_p(outfilename)
+                cropped.save(outfilename)
+    # outfilename = "versions/{}/tiles/rendered/{}/{}_{}_full.png".format(version, mapId, plane, zoom)
+    # mkdir_p(outfilename)
+    # zoomed.save(outfilename)
 
 #### MAIN ####
 
