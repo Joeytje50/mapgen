@@ -1,7 +1,7 @@
 import json
 import os
+import errno
 from PIL import Image, ImageFilter, ImageEnhance
-import os.path
 import sys
 import errno
 import glob
@@ -23,8 +23,9 @@ def mem():
 def mkdir_p(path):
     try:
         os.makedirs(os.path.dirname(path))
-    except OSError as exc:
-        pass
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            print('failed to mkdir', path, e)
 
 def getBounds(regionList):
     lowX, lowY, highX, highY = 9999, 9999, 0, 0
@@ -147,6 +148,74 @@ def layerBelow(im):
     im = im.filter(ImageFilter.GaussianBlur(radius=1))
     return im
 
+def buildMapID(defn, version, icons, iconSprites, baseMaps):
+    mapId = -1
+    if 'mapId' in defn:
+        mapId = defn['mapId']
+    elif 'fileId' in defn:
+        mapId = defn['fileId']
+    lowX, highX, lowY, highY, planes = getBounds(defn['regionList'])
+    bounds = [[lowX * 64 - PADDING, lowY * 64 - PADDING], [(highX + 1) * 64 + PADDING, (highY + 1) * 64 + PADDING]]
+    # bounds = [[0, 0], [12800, 12800]]
+    if 'position' in defn:
+        center = [defn['position']['x'], defn['position']['y']]
+    else:
+        print('cent')
+        center = [(lowX + highX + 1) * 32, (lowY + highY + 1) * 32]
+    baseMaps.append({'mapId': mapId, 'name': defn['name'], 'bounds': bounds, 'center': center})
+    overallHeight = (highY - lowY + 1) * px_per_square * 64
+    overallWidth = (highX - lowX + 1) * px_per_square * 64
+
+    layersBelow = None
+    for plane in range(planes):
+        print(mapId, plane)
+        im, validIcons = buildImage(defn, icons, version, plane, overallWidth, overallHeight)
+        if plane == 0:
+            data = np.asarray(im.convert('RGB')).copy()
+            data[(data == (255, 0, 255)).all(axis = -1)] = (0, 0, 0)
+            im = Image.fromarray(data, mode='RGB')
+            if planes > 1:
+                layersBelow = layerBelow(im)
+        elif plane > 0:
+            data = np.asarray(im.convert('RGBA')).copy()
+            data[:,:,3] = 255*(data[:,:,:3] != (255, 0, 255)).all(axis = -1)
+            mask = Image.fromarray(data, mode='RGBA')
+            im = layersBelow.convert("RGBA")
+            im.paste(mask, (0, 0), mask)
+            if planes > plane and INTERMEDIATE:
+                layersBelow.paste(layerBelow(mask))
+        mem()
+
+        for zoom in range(-3, 4):
+            scalingFactor = 2.0**zoom/2.0**2
+            zoomedWidth = int(round(scalingFactor * im.width))
+            zoomedHeight = int(round(scalingFactor * im.height))
+            zoomed = im.resize((zoomedWidth, zoomedHeight), resample=Image.BILINEAR)
+            if zoom >= 0:
+                for x, y, spriteId in validIcons:
+                    sprite = iconSprites[spriteId]
+                    width, height = sprite.size
+                    imX = int(round((x - lowX * 64) * px_per_square * scalingFactor)) - width // 2 - 2
+                    imY = int(round(((highY + 1) * 64 - y) * px_per_square * scalingFactor)) - height // 2 - 2
+                    zoomed.paste(sprite, (imX+int(round(256*scalingFactor)), int(round(imY+256 * scalingFactor))), sprite)
+
+            lowZoomedX = int((lowX - 1) * scalingFactor + 0.01)
+            highZoomedX = int((highX + 0.9 + 1) * scalingFactor + 0.01)
+            lowZoomedY = int((lowY - 1) * scalingFactor + 0.01)
+            highZoomedY = int((highY + 0.9 + 1) * scalingFactor + 0.01)
+            for x in range(lowZoomedX, highZoomedX + 1):
+                for y in range(lowZoomedY, highZoomedY + 1):
+                    coordX = int((x - (lowX - 1) * scalingFactor) * 256)
+                    coordY = int((y - (lowY - 1) * scalingFactor) * 256)
+                    cropped = zoomed.crop((coordX, zoomed.size[1] - coordY - 256, coordX + 256, zoomed.size[1] - coordY))
+                    if not allBlack(cropped):
+                        outfilename = "versions/{}/tiles/rendered/{}/{}/{}_{}_{}.png".format(version, mapId, zoom, plane, x, y)
+                        mkdir_p(outfilename)
+                        cropped.save(outfilename)
+            # outfilename = "versions/{}/tiles/rendered/{}/{}_{}_full.png".format(version, mapId, plane, zoom)
+            # mkdir_p(outfilename)
+            # zoomed.save(outfilename)
+
 #### MAIN ####
 
 def main():
@@ -187,72 +256,7 @@ def main():
 
     baseMaps = []
     for defn in defs:
-        mapId = -1
-        if 'mapId' in defn:
-            mapId = defn['mapId']
-        elif 'fileId' in defn:
-            mapId = defn['fileId']
-        lowX, highX, lowY, highY, planes = getBounds(defn['regionList'])
-        bounds = [[lowX * 64 - PADDING, lowY * 64 - PADDING], [(highX + 1) * 64 + PADDING, (highY + 1) * 64 + PADDING]]
-        # bounds = [[0, 0], [12800, 12800]]
-        if 'position' in defn:
-            center = [defn['position']['x'], defn['position']['y']]
-        else:
-            print('cent')
-            center = [(lowX + highX + 1) * 32, (lowY + highY + 1) * 32]
-        baseMaps.append({'mapId': mapId, 'name': defn['name'], 'bounds': bounds, 'center': center})
-        overallHeight = (highY - lowY + 1) * px_per_square * 64
-        overallWidth = (highX - lowX + 1) * px_per_square * 64
-
-        layersBelow = None
-        for plane in range(planes):
-            print(mapId, plane)
-            im, validIcons = buildImage(defn, icons, version, plane, overallWidth, overallHeight)
-            if plane == 0:
-                data = np.asarray(im.convert('RGB')).copy()
-                data[(data == (255, 0, 255)).all(axis = -1)] = (0, 0, 0)
-                im = Image.fromarray(data, mode='RGB')
-                if planes > 1:
-                    layersBelow = layerBelow(im)
-            elif plane > 0:
-                data = np.asarray(im.convert('RGBA')).copy()
-                data[:,:,3] = 255*(data[:,:,:3] != (255, 0, 255)).all(axis = -1)
-                mask = Image.fromarray(data, mode='RGBA')
-                im = layersBelow.convert("RGBA")
-                im.paste(mask, (0, 0), mask)
-                if planes > plane and INTERMEDIATE:
-                    layersBelow.paste(layerBelow(mask))
-            mem()
-
-            for zoom in range(-3, 4):
-                scalingFactor = 2.0**zoom/2.0**2
-                zoomedWidth = int(round(scalingFactor * im.width))
-                zoomedHeight = int(round(scalingFactor * im.height))
-                zoomed = im.resize((zoomedWidth, zoomedHeight), resample=Image.BILINEAR)
-                if zoom >= 0:
-                    for x, y, spriteId in validIcons:
-                        sprite = iconSprites[spriteId]
-                        width, height = sprite.size
-                        imX = int(round((x - lowX * 64) * px_per_square * scalingFactor)) - width // 2 - 2
-                        imY = int(round(((highY + 1) * 64 - y) * px_per_square * scalingFactor)) - height // 2 - 2
-                        zoomed.paste(sprite, (imX+int(round(256*scalingFactor)), int(round(imY+256 * scalingFactor))), sprite)
-
-                lowZoomedX = int((lowX - 1) * scalingFactor + 0.01)
-                highZoomedX = int((highX + 0.9 + 1) * scalingFactor + 0.01)
-                lowZoomedY = int((lowY - 1) * scalingFactor + 0.01)
-                highZoomedY = int((highY + 0.9 + 1) * scalingFactor + 0.01)
-                for x in range(lowZoomedX, highZoomedX + 1):
-                    for y in range(lowZoomedY, highZoomedY + 1):
-                        coordX = int((x - (lowX - 1) * scalingFactor) * 256)
-                        coordY = int((y - (lowY - 1) * scalingFactor) * 256)
-                        cropped = zoomed.crop((coordX, zoomed.size[1] - coordY - 256, coordX + 256, zoomed.size[1] - coordY))
-                        if not allBlack(cropped):
-                            outfilename = "versions/{}/tiles/rendered/{}/{}/{}_{}_{}.png".format(version, mapId, zoom, plane, x, y)
-                            mkdir_p(outfilename)
-                            cropped.save(outfilename)
-                # outfilename = "versions/{}/tiles/rendered/{}/{}_{}_full.png".format(version, mapId, plane, zoom)
-                # mkdir_p(outfilename)
-                # zoomed.save(outfilename)
+        buildMapID(defn, version, icons, iconSprites, baseMaps)
 
     with open("versions/{}/basemaps.json".format(version, 'w')) as f:
         json.dump(baseMaps, f)
