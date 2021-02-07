@@ -250,6 +250,23 @@ def zoomLevels(im, validIcons, zoom, version, mapId, plane, iconSprites, regionL
     # mkdir_p(outfilename)
     # zoomed.save(outfilename)
 
+def fixGnomes(version):
+    # Clean up Gnome Stronghold and Village; their black paths should not be deleted
+    for plane in range(1,4):
+        # planes 1,2,3
+        for xy in [(37,53), (38, 53), (37,54), (38,54), (39,49)]:
+            filename = "versions/{}/tiles/base/{}_{}_{}.png".format(version, plane, xy[0], xy[1])
+            if os.path.exists(filename):
+                im = Image.open(filename)
+                data = np.asarray(im.convert('RGBA')).copy()
+                # Change full black to near-full black to preserve its opacity.
+                np.save('preGnome', data)
+                data[:,:,:3][(data == (0,0,0,255)).all(axis=-1)] += 1
+                np.save('postGnome', data)
+                im = Image.fromarray(data, mode='RGBA')
+                # Overwrite original, since we'll use this 'fixed' version for everything now
+                im.save(filename)
+
 #### MAIN ####
 
 def main():
@@ -259,6 +276,14 @@ def main():
         version = sys.argv[1].lstrip('versions/').rstrip('/')
     else:
         version = "2020-08-12_a"
+
+    # Make gnome paths not become transparent
+    ctx = mp.get_context('spawn')
+    gnomes = ctx.Process(
+            target=fixGnomes,
+            args=(version,)
+    )
+    gnomes.start() # leave this in the background while we prepare the rest of the function
 
     with open("versions/{}/worldMapDefinitions.json".format(version)) as f:
         defs = json.load(f)
@@ -288,8 +313,10 @@ def main():
         spriteId = int(file.split("/")[-1][:-4])
         iconSprites[spriteId] = Image.open(file)
 
+    gnomes.join() # wait for preprocessing the gnome tiles is done
+    print("gnome'd")
+
     baseMaps = []
-    ctx = mp.get_context('spawn')
     q = ctx.Queue()
     for defn in defs:
         p = ctx.Process(
