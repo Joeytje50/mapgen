@@ -8,18 +8,27 @@ import glob
 import numpy as np
 from collections import defaultdict
 import multiprocessing as mp
+import resource
 
 #Constants
 PADDING = 64
-FULLMAP = False
+FULLMAP = True
 INTERMEDIATE = True
 px_per_square = 4
+MEMDEBUG = True
 
 #Filters
 ENHANCE = 0.5 # grayscale: in range 0 (100% grayscale) to 1 (original)
 BRIGHT = 0.7 # brightness: in range 0 (100% black) to 1 (original)
 CONTRAST = 1.0 # contrast: in range 0 (100% grey) to 1 (original)
 BLUR = 1 # Gaussian blur radius in px: 0 (original) or higher for more blur.
+
+def mem(loc):
+    if MEMDEBUG:
+        print('{} memory usage  : {:2.2f} MB / {:2.2f} MB'.format(loc,
+            round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024.0,1),
+            round(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss/1024.0,1)
+        ), file=sys.stderr)
 
 def mkdir_p(path):
     try:
@@ -91,7 +100,7 @@ def buildImage(queue, im, defn, icons, version, plane, overallWidth, overallHeig
             newHighX = region['xUpperRight']
             newLowY = region['yLowerRight']
             newHighY = region['yUpperRight']
-            print(oldLowX == newLowX, oldLowY == newLowY, oldHighX == newHighX, oldHighY == newHighY)
+            #print(oldLowX == newLowX, oldLowY == newLowY, oldHighX == newHighX, oldHighY == newHighY)
             validIcons.extend(getIconsInsideArea(icons, region['plane'] + plane, oldLowX, oldHighX, oldLowY, oldHighY, allPlanes=plane==0))
             for x in range(oldLowX, oldHighX + 1):
                 for y in range(oldLowY, oldHighY + 1):
@@ -140,6 +149,7 @@ def buildImage(queue, im, defn, icons, version, plane, overallWidth, overallHeig
                         im.paste(square, box=(imX+256, imY+256))
         else:
             raise ValueError(region)
+    mem(' built')
     # return values in queue
     queue.put(im)
     queue.put(validIcons)
@@ -177,7 +187,7 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
     for plane in range(planes):
         print(mapId, plane)
         im = Image.new("RGB", (overallWidth + 512, overallHeight + 512))
-
+        mem('loaded')
         # run this in a separate process to allow better cleaning up after running this function.
         ctx = mp.get_context('spawn')
         q = ctx.Queue()
@@ -187,6 +197,7 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
         )
         p.start()
         im = q.get()
+        mem('getimg')
         validIcons = q.get()
         p.join()
 
@@ -220,6 +231,8 @@ def buildMapID(defn, version, icons, iconSprites, baseMaps):
             p.join() # May be possible to paralellize this
 
 def zoomLevels(im, validIcons, zoom, version, mapId, plane, iconSprites, regionList):
+    if mapId == -1:
+        print('zoom', plane, zoom)
     lowX, highX, lowY, highY, planes = getBounds(regionList)
     scalingFactor = 2.0**zoom/2.0**2
     zoomedWidth = int(round(scalingFactor * im.width))
@@ -237,6 +250,7 @@ def zoomLevels(im, validIcons, zoom, version, mapId, plane, iconSprites, regionL
     highZoomedX = int((highX + 0.9 + 1) * scalingFactor + 0.01)
     lowZoomedY = int((lowY - 1) * scalingFactor + 0.01)
     highZoomedY = int((highY + 0.9 + 1) * scalingFactor + 0.01)
+    mem('zoomlv')
     for x in range(lowZoomedX, highZoomedX + 1):
         for y in range(lowZoomedY, highZoomedY + 1):
             coordX = int((x - (lowX - 1) * scalingFactor) * 256)
@@ -305,7 +319,7 @@ def main():
             overallXHigh = max(x, overallXHigh)
             overallXLow = min(x, overallXLow)
 
-        defs.append({"name": "debug", "mapId": -1, "regionList": [{"xLowerLeft": overallXLow, "yUpperRight": overallYHigh, "yLowerRight": overallYLow, "yLowerLeft": overallYLow, "numberOfPlanes": 4, "xUpperLeft": overallXLow, "xUpperRight": overallXHigh, "yUpperLeft": overallYHigh, "plane": 0, "xLowerRight": overallXHigh}]})
+        defs.insert(0, {"name": "debug", "mapId": -1, "regionList": [{"xLowerLeft": overallXLow, "yUpperRight": overallYHigh, "yLowerRight": overallYLow, "yLowerLeft": overallYLow, "numberOfPlanes": 4, "xUpperLeft": overallXLow, "xUpperRight": overallXHigh, "yUpperLeft": overallYHigh, "plane": 0, "xLowerRight": overallXHigh}]})
 
 
     iconSprites = {}
@@ -324,11 +338,15 @@ def main():
             args=(defn, version, icons, iconSprites, q)
         )
         p.start()
+        mem('  main')
         baseMaps.append(q.get())
         p.join()
 
     with open("versions/{}/basemaps.json".format(version, 'w')) as f:
-        json.dump(baseMaps, f)
+        try:
+            json.dump(baseMaps, f)
+        except IOError as e:
+            print("Dumping baseMaps failed:", e)
 
 if __name__ == "__main__":
     main()
